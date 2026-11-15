@@ -1,0 +1,25 @@
+{
+  "name": "cdt-monitor-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "echarts": "^6.1.0",
+    "lucide": "^1.70.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.6"
+  },
+  "engines": {
+    "node": ">=26.13.0 <27",
+    "bun": ">=1.2"
+  }
+}

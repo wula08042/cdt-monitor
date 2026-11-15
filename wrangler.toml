@@ -1,0 +1,111 @@
+#:schema node_modules/wrangler/config-schema.json
+#
+# Cloudflare Workers 配置
+# ============================================================================
+# 部署方式：**Cloudflare Dashboard 连接 GitHub 仓库，推送即自动发布**。
+# 建库、建表、上传全部自动化，不需要本地装 Rust，也不需要去控制台粘 SQL。
+#
+# 一次性准备（全部在网页完成）：
+#   1. 连接 GitHub：Workers & Pages → Create → Workers → Connect to Git
+#        Build command : bun run build
+#        Deploy command: bun run deploy      ← 自动建库 + 迁移 + 发布
+#        Build variable: BUN_VERSION=1.4.4
+#        Node: .node-version 指定 26.13.0；已有 NODE_VERSION 变量需同步或删除
+#   2. 配运行时 Secret：Settings → Variables and Secrets
+#        MASTER_KEY      openssl rand -hex 32
+#        ADMIN_USERNAME  管理员用户名
+#        ADMIN_PASSWORD  管理员密码
+#
+# 之后所有业务配置（阿里云账号、Turnstile、Telegram、Bark、日报、时区）
+# 都在**网页「设置」里改**，存 D1，即时生效，不需要重新部署。
+#
+# Turnstile 默认**不启用**：不填就是不校验，登录只看用户名 + 密码。
+# 需要人机校验时到 设置 → 人机校验 填 Site Key / Secret Key 即可。
+#
+# ⚠️ 构建期变量（BUN_VERSION）与运行时变量是两处配置，别放错：
+#      Settings → Build → Build variables   → BUN_VERSION
+#      Settings → Variables and Secrets     → MASTER_KEY 等（选 Secret）
+# ============================================================================
+
+name = "cdt-monitor"
+
+# 由 bun run build 生成，不要手改
+main = "build/worker/shim.mjs"
+
+compatibility_date = "2026-10-01"
+
+# 强制全局 fetch 只走公网：本 Worker 要访问阿里云、Telegram、Bark 等
+# 第三方服务，走公网才是预期行为，避免误命中同账号内的私有来源。
+# worker::Delay 使用 Web 标准的数字 timer ID，禁用 Node.js Timeout 对象。
+compatibility_flags = ["global_fetch_strictly_public", "no_nodejs_global_timers"]
+
+workers_dev = true
+
+# 关闭 Preview URLs：预览域名会把未发布的版本暴露到公网，
+# 而这里存的是阿里云凭据。
+preview_urls = false
+
+# 构建由 bun run build / bun run dev 显式负责，部署不重复构建。
+
+# ---------------------------------------------------------------------------
+# D1：**刻意不写 database_id**
+#
+# wrangler 会按 database_name 自动发现并绑定数据库；首次部署时
+# `scripts/deploy.ts` 会先 `d1 create` 再 `d1 migrations apply`。
+# 这样连 Git 仓库后不需要先去控制台建库、复制 id、改配置、再提交。
+#
+# 只有当你希望绑定到**已存在的其它库**时，才需要显式补上 database_id。
+# ---------------------------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "cdt-monitor"
+migrations_dir = "migrations"
+
+# ---------------------------------------------------------------------------
+# 前端静态资源
+#
+# 产物在 web/dist（由 scripts/build-ci.sh 构建）。
+# `run_worker_first = ["/api/*"]` 只让 API 进 Worker，其余静态资源由边缘
+# 直接返回 —— 不消耗 Worker 请求配额，也没有冷启动等待。
+# ---------------------------------------------------------------------------
+[assets]
+directory = "./web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+# 每 5 分钟巡检一次：流量采样 → 额度熔断 → 定时开关机 → 抢占式保活 → 日报
+[triggers]
+crons = ["*/5 * * * *"]
+
+# 每条消息处理一个账号或一段任务，避免共享免费版 50 次 D1 调用额度。
+[[queues.producers]]
+binding = "TASKS"
+queue = "cdt-monitor-tasks"
+
+[[queues.consumers]]
+queue = "cdt-monitor-tasks"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+retry_delay = 60
+max_concurrency = 2
+dead_letter_queue = "cdt-monitor-tasks-dlq"
+
+# ---------------------------------------------------------------------------
+# 可观测性：保留应用错误日志，关闭逐请求调用日志以控制写入量。
+#
+# 默认应用层只输出 error；排障时在设置中临时改为 info / warn。
+# ---------------------------------------------------------------------------
+[observability.logs]
+enabled = true
+invocation_logs = false
+head_sampling_rate = 1
+
+# ---------------------------------------------------------------------------
+# 无 [vars] 段
+#
+# 运行时只读取三个 Secret：MASTER_KEY / ADMIN_USERNAME / ADMIN_PASSWORD。
+# 日志级别、任务锁窗口、时区、通知、Turnstile 等全部存 D1，
+# 在网页「设置」里改，改完即时生效，不需要重新部署。
+# ---------------------------------------------------------------------------

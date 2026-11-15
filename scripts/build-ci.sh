@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+#
+# Cloudflare Workers Builds 构建脚本
+# ============================================================================
+# Cloudflare 构建环境只有 Node，无 Rust 与 worker-build，本脚本负责
+# 安装工具链并完成构建，可重复执行（每次重建前端，Rust 使用 Cargo 的依赖缓存）。
+#
+# 调用来源：
+#   1. Dashboard → Settings → Build → Build command
+#   2. 本地 bun run build；部署仅上传已构建产物。
+#
+# 必需构建期变量（Settings → Build → Build variables）：
+#   BUN_VERSION   Bun 版本，例如 1.4.4
+#                 Cloudflare 也会读取 package.json 的 packageManager
+#   NODE_VERSION  可省略；.node-version 固定 Node 26.13.0
+#
+# 构建期变量仅在构建阶段可见。运行时变量 MASTER_KEY / ADMIN_USERNAME /
+# ADMIN_PASSWORD 需配置在 Settings → Variables and Secrets 并选择 Secret。
+# ============================================================================
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+
+log "Node: $(node --version)"
+node --input-type=module -e 'import {readFileSync} from "node:fs"; const expected = readFileSync(".node-version", "utf8").trim(); if (process.versions.node !== expected) { console.error(`需要 Node ${expected}，当前 ${process.versions.node}；请检查构建变量 NODE_VERSION`); process.exit(1) }'
+
+# ---------------------------------------------------------------------------
+# 1. Bun
+# ---------------------------------------------------------------------------
+export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
+export PATH="$BUN_INSTALL/bin:$PATH"
+
+# 版本不匹配（含镜像预装旧版）时安装指定版本。
+# 不能只在「未安装」时装：构建镜像自带 Bun 1.2.5，跳过安装会让 BUN_VERSION 失效。
+installed="$(bun --version 2>/dev/null || true)"
+
+if [ -z "${BUN_VERSION:-}" ]; then
+  if [ -n "$installed" ]; then
+    # 本地开发未指定版本：用现有版本，避免每次构建都下载
+    BUN_VERSION="$installed"
+  else
+    echo "错误：未设置 BUN_VERSION，且环境中没有 Bun。" >&2
+    echo "Cloudflare 构建需在 Settings → Build → Build variables 配置 BUN_VERSION。" >&2
+    exit 1
+  fi
+fi
+
+if [ "$installed" != "$BUN_VERSION" ]; then
+  log "安装 Bun $BUN_VERSION（当前 ${installed:-未安装}）"
+  curl -fsSL https://bun.sh/install | bash -s "bun-v$BUN_VERSION"
+  export PATH="$BUN_INSTALL/bin:$PATH"
+fi
+log "Bun: $(bun --version)"
+log "配置自检"
+bun run scripts/check-config.ts
+
+# ---------------------------------------------------------------------------
+# 2. Rust 工具链
+# ---------------------------------------------------------------------------
+if ! command -v cargo >/dev/null 2>&1; then
+  log "安装 Rust（rustup, minimal profile）"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain none
+  # shellcheck disable=SC1091
+  . "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+log "Rust: $(cargo --version)"
+
+if ! cargo clippy --version >/dev/null 2>&1; then
+  rustup component add clippy
+fi
+
+# rust-toolchain.toml 声明了 wasm32-unknown-unknown，但 Cloudflare 用的是
+# 一次性容器，rustup 可能还没装这个 target。
+target_libdir="$(rustc --print target-libdir --target wasm32-unknown-unknown)"
+if [ ! -d "$target_libdir" ]; then
+  log "安装 wasm32-unknown-unknown target"
+  if command -v rustup >/dev/null 2>&1; then
+    rustup target add wasm32-unknown-unknown
+  else
+    echo "错误：当前 Rust 缺少 wasm32-unknown-unknown 标准库，请通过系统包管理器或 rustup 安装。" >&2
+    exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 3. worker-build
+# ---------------------------------------------------------------------------
+bash scripts/install-worker-build.sh
+log "worker-build: $ROOT/.tools/worker-build/bin/worker-build"
+
+# ---------------------------------------------------------------------------
+# 4. 依赖安装
+# ---------------------------------------------------------------------------
+log "安装根依赖（wrangler）"
+bun install --frozen-lockfile
+
+log "安装前端依赖"
+( cd web && bun install --frozen-lockfile )
+
+# ---------------------------------------------------------------------------
+# 5. 构建前端
+# ---------------------------------------------------------------------------
+log "前端类型检查"
+bun run typecheck:web
+
+log "Rust 单元测试与 Clippy"
+cargo test --locked
+cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+
+log "构建前端 → web/dist"
+( cd web && bun run build )
+
+if [ ! -f web/dist/index.html ]; then
+  echo "错误：前端构建失败，web/dist/index.html 不存在" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 6. 构建 Worker（Rust → Wasm）
+# ---------------------------------------------------------------------------
+log "构建 Worker → build/worker/shim.mjs"
+bun run build:worker
+
+if [ ! -f build/worker/shim.mjs ]; then
+  echo "错误：Worker 构建失败，build/worker/shim.mjs 不存在" >&2
+  exit 1
+fi
+
+log "Worker 集成测试（复用已构建产物，云接口全部模拟）"
+bun run test:worker:built
+
+# ---------------------------------------------------------------------------
+# 7. 用 Wrangler 打包完整产物并校验大小（不发布、不连接云资源）。
+# ---------------------------------------------------------------------------
+# 当前平台按未压缩 Worker 包体计数，上限 64 MiB；不按单个 Wasm 文件判断。
+log "校验 Worker 包体"
+bun run scripts/check-bundle.ts
+
+log "完成。产物："
+echo "  web/dist/index.html"
+echo "  build/worker/shim.mjs"
